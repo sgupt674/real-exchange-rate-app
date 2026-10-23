@@ -433,21 +433,60 @@ with right:
         index=country_names.index("United States"),
     )
 
+# Use explicit month/year dropdowns instead of the native calendar widget.
+# This makes every year selectable without relying on the calendar's scrollable
+# year list, which can be difficult to navigate in some browsers.
+MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+MONTH_TO_NUMBER = {name: number for number, name in enumerate(MONTHS, start=1)}
+first_year = 1947
+current_date = date.today()
+years = list(range(first_year, current_date.year + 1))
+
 date_col_1, date_col_2 = st.columns(2)
 with date_col_1:
-    start_date = st.date_input(
-        "Start month",
-        value=date(1976, 1, 1),
-        min_value=date(1947, 1, 1),
-        max_value=date.today(),
-    )
+    st.markdown("**Start month**")
+    start_month_col, start_year_col = st.columns(2)
+    with start_month_col:
+        start_month_name = st.selectbox(
+            "Start month name",
+            MONTHS,
+            index=0,
+            key="start_month_name",
+            label_visibility="collapsed",
+        )
+    with start_year_col:
+        start_year = st.selectbox(
+            "Start year",
+            years,
+            index=years.index(1976),
+            key="start_year",
+            label_visibility="collapsed",
+        )
 with date_col_2:
-    end_date = st.date_input(
-        "End month",
-        value=date.today().replace(day=1),
-        min_value=date(1947, 1, 1),
-        max_value=date.today(),
-    )
+    st.markdown("**End month**")
+    end_month_col, end_year_col = st.columns(2)
+    with end_month_col:
+        end_month_name = st.selectbox(
+            "End month name",
+            MONTHS,
+            index=current_date.month - 1,
+            key="end_month_name",
+            label_visibility="collapsed",
+        )
+    with end_year_col:
+        end_year = st.selectbox(
+            "End year",
+            years,
+            index=years.index(current_date.year),
+            key="end_year",
+            label_visibility="collapsed",
+        )
+
+start_date = date(start_year, MONTH_TO_NUMBER[start_month_name], 1)
+end_date = date(end_year, MONTH_TO_NUMBER[end_month_name], 1)
 
 chart_mode = st.radio(
     "Chart display",

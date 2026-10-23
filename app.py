@@ -563,6 +563,32 @@ if st.button("Load data and calculate RER", type="primary", use_container_width=
         m2.metric("First available month", result["date"].min().strftime("%b %Y"))
         m3.metric("Last available month", result["date"].max().strftime("%b %Y"))
 
+        # Explicitly report gaps inside the observed span. Do not treat months
+        # after the last available observation as missing data points.
+        observed_months = pd.PeriodIndex(result["date"], freq="M").unique().sort_values()
+        if len(observed_months) > 0:
+            expected_months = pd.period_range(
+                start=observed_months.min(), end=observed_months.max(), freq="M"
+            )
+            missing_months = expected_months.difference(observed_months)
+        else:
+            missing_months = pd.PeriodIndex([], freq="M")
+
+        if len(missing_months):
+            missing_labels = ", ".join(str(month) for month in missing_months)
+            st.warning(
+                f"{len(missing_months)} month(s) are missing between the first and "
+                f"last available observations: {missing_labels}. These months are "
+                "excluded from the RER average and real index. The app does not "
+                "interpolate or invent missing observations."
+            )
+        else:
+            st.info(
+                "No missing months were detected between the first and last "
+                "available observations. Months after the last available observation "
+                "are not counted as internal gaps."
+            )
+
         st.subheader(f"{country_1} vs {country_2}")
         if chart_mode == "Both":
             fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -677,4 +703,3 @@ st.caption(
     "Data source: IMF SDMX 3.0 API. Data availability and definitions vary by country. "
     "Check the exported FX units and manually verify one observation before submitting."
 )
-

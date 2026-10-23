@@ -1,71 +1,58 @@
 # Real Exchange Rate Explorer
 
-A Streamlit app for comparing the monthly real exchange rate (RER) of two economies using consumer price indices (CPI) and exchange rates.
+A Streamlit application for comparing monthly CPI and exchange-rate data from the IMF SDMX 3.0 API.
 
 ## Files
 
-- `app.py` — Streamlit app, data retrieval, calculations, charts, and CSV export.
-- `requirements.txt` — Python dependencies for Streamlit Community Cloud.
-- `README.md` — project description and setup instructions.
+- `app.py` — Streamlit app and RER calculations.
+- `requirements.txt` — Python dependencies.
+- `README.md` — setup and assignment notes.
 
-## Calculation used
+## Run on Streamlit Community Cloud
 
-The IMF exchange-rate series is expected to be expressed as local-currency units per US dollar.
+1. Keep all three files at the top level of the public GitHub repository.
+2. In Streamlit Community Cloud, deploy the repository's `main` branch and set the main file path to `app.py`.
+3. Select Python 3.12 in Advanced settings if prompted.
+4. No IMF API key is normally required.
 
-- `S(t) = FX_1(t) / FX_2(t)` — units of Country 2 currency per unit of Country 1 currency.
-- `RER(t) = S(t) * CPI_1(t) / CPI_2(t)`.
-- `RER benchmark = arithmetic mean of RER over valid months in the selected sample`.
-- `Real Index(t) = 100 * RER(t) / RER benchmark`.
+## Economic definition used
 
-The app calculates the benchmark over the selected date range and only uses months with valid, positive observations for all four input series. It does not interpolate missing values.
+The assignment defines `S(t)` as units of Country 2 currency per one unit of Country 1 currency:
 
-## Run locally
+`RER(t) = S(t) × CPI_1(t) / CPI_2(t)`
 
-Python 3.12 is recommended.
+IMF exchange-rate series are quoted as local-currency units per USD. If `FX_1` is Country 1 currency per USD and `FX_2` is Country 2 currency per USD, then:
 
-```bash
-python -m venv .venv
-```
+`S(t) = FX_2(t) / FX_1(t)`
 
-Activate the environment:
+The app calculates the average `RER*` over valid months within the selected date range, then:
 
-- Windows PowerShell: `.venv\\Scripts\\Activate.ps1`
-- macOS/Linux: `source .venv/bin/activate`
+`Real_Index(t) = 100 × RER(t) / RER*`
 
-Install dependencies and start the app:
+The index average should equal 100 over the valid observations in the selected sample (subject to rounding).
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+## Data coverage
 
-## Publish on Streamlit Community Cloud
+The requested start date defaults to January 1976. IMF coverage varies by country and series; the app reports the first and last available month and uses only months with valid data for both countries. It does not fabricate or fill missing observations. The IMF uses `G163` for the Euro area.
 
-1. Push `app.py`, `requirements.txt`, and `README.md` to the root of your public GitHub repository.
-2. Go to <https://share.streamlit.io/> and sign in with GitHub.
-3. Select **Create app**, choose your repository and branch (`main`), and set the main file path to `app.py`.
-4. Select Python 3.12 in advanced settings if that option is offered, then deploy.
-5. Open the deployed URL and test the country selectors, date range, chart options, and CSV download.
+Series keys used:
+- CPI: `{country_code}.CPI._T.IX.M`
+- Exchange rate: `{country_code}.XDC_USD.PA_RT.M`
 
-## IMF data and fallback
+The app includes a broad country list. If a country/series code is not accepted by the IMF API, try a shorter date range or another country and retain the displayed error for troubleshooting.
 
-The app attempts to retrieve monthly CPI and exchange-rate series from the IMF SDMX 3.0 API. IMF dataset organization, series keys, and access rules may change, and series availability differs by economy. If the API does not return the requested series, choose **Upload CSV files** in the app and upload a long-format CSV with these columns:
+## CSV upload fallback
 
-| date | country | cpi | fx |
-|---|---|---:|---:|
-| 2020-01-01 | Euro area | 100.0 | 0.90 |
-| 2020-01-01 | United States | 100.0 | 1.00 |
+CSV columns must be `date,country,cpi,fx`. Use one row per country per month. The `fx` column must be local-currency units per USD. The country column should contain the exact selected country name or its IMF code.
 
-The example numbers above are illustrative only, not actual observations. Use the exact country names selected in the app. `date` should be monthly; `cpi` is the CPI index; and `fx` must be local-currency units per USD. The app does not treat illustrative examples as real data.
+## Required checks before submitting
 
-## Important interpretation note
+1. Select United Kingdom as Country 1 and United States as Country 2. The nominal exchange rate must be quoted as USD per GBP.
+2. Change the sample dates and verify the real-index mean is 100 over valid sample months.
+3. Test Real, Nominal, and Both chart modes.
+4. Use the manual verification expander to verify one row from the CSV.
+5. Download the CSV and include it with the Streamlit URL, GitHub URL, prompt/model/date information, and a manual calculation in the assignment submission.
 
-An index above 100 means the calculated RER is above its mean over the selected sample; below 100 means it is below that mean. This does not, by itself, establish that a currency is objectively overvalued or undervalued. Results depend on the chosen sample, data definitions, quotation convention, and economic context.
+## Prompt/model record
 
-## Project checklist
-
-- [ ] Confirm IMF API data loads for your selected countries, or use a documented CSV data source.
-- [ ] Verify at least one RER observation manually using `RER = (FX_1 / FX_2) * (CPI_1 / CPI_2)`.
-- [ ] Test the real-index, nominal-rate, and both-axes chart modes.
-- [ ] Download the CSV and confirm it contains raw inputs and calculated columns.
-- [ ] Save the GitHub repository URL and deployed Streamlit URL for submission.
+Record the actual prompt(s), model name(s), and date(s) used to develop and revise the app in your assignment submission. Do not claim an earlier prompt or model was used if you did not save that record.

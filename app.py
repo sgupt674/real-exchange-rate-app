@@ -532,6 +532,34 @@ if st.button("Load data and calculate RER", type="primary", use_container_width=
         m2.metric("First available month", result["date"].min().strftime("%b %Y"))
         m3.metric("Last available month", result["date"].max().strftime("%b %Y"))
 
+        # Make gaps in the common monthly sample visible instead of silently
+        # reporting only the count of valid rows.
+        first_month = result["date"].min().to_period("M")
+        last_month = result["date"].max().to_period("M")
+        expected_months = pd.period_range(first_month, last_month, freq="M")
+        observed_months = pd.PeriodIndex(result["date"].dt.to_period("M").unique(), freq="M")
+        missing_months = expected_months.difference(observed_months)
+
+        if len(missing_months):
+            missing_text = ", ".join(str(month) for month in missing_months)
+            st.warning(
+                f"Data coverage check: {len(missing_months)} month(s) are missing "
+                f"between the first and last available observations: {missing_text}. "
+                "These months are excluded from the RER average and real index. "
+                "Check source-series availability before interpreting the results."
+            )
+        else:
+            st.info("Data coverage check: no missing months between the first and last available observations.")
+
+        requested_last = pd.Period(end_period, freq="M")
+        if last_month < requested_last:
+            st.info(
+                f"The requested end month is {requested_last}, but the latest "
+                f"common valid observation is {last_month}. Later months are not "
+                "included because both countries' required data are not available "
+                "as a valid matched observation."
+            )
+
         st.subheader(f"{country_1} vs {country_2}")
         if chart_mode == "Both":
             fig = make_subplots(specs=[[{"secondary_y": True}]])

@@ -433,60 +433,52 @@ with right:
         index=country_names.index("United States"),
     )
 
-# Use explicit month/year dropdowns instead of the native calendar widget.
-# This makes every year selectable without relying on the calendar's scrollable
-# year list, which can be difficult to navigate in some browsers.
-MONTHS = [
+# Use explicit month/year dropdowns so the year list begins at 1976.
+today = date.today()
+year_options = list(range(1976, today.year + 1))
+month_names = [
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 ]
-MONTH_TO_NUMBER = {name: number for number, name in enumerate(MONTHS, start=1)}
-first_year = 1947
-current_date = date.today()
-years = list(range(first_year, current_date.year + 1))
 
-date_col_1, date_col_2 = st.columns(2)
-with date_col_1:
+start_col, end_col = st.columns(2)
+with start_col:
     st.markdown("**Start month**")
-    start_month_col, start_year_col = st.columns(2)
-    with start_month_col:
-        start_month_name = st.selectbox(
-            "Start month name",
-            MONTHS,
-            index=0,
-            key="start_month_name",
-            label_visibility="collapsed",
-        )
+    start_year_col, start_month_col = st.columns(2)
     with start_year_col:
         start_year = st.selectbox(
-            "Start year",
-            years,
-            index=years.index(1976),
-            key="start_year",
-            label_visibility="collapsed",
+            "Start year", year_options,
+            index=year_options.index(1976), key="start_year",
         )
-with date_col_2:
+    start_month_options = list(range(1, 13))
+    if start_year == today.year:
+        start_month_options = list(range(1, today.month + 1))
+    with start_month_col:
+        start_month = st.selectbox(
+            "Start month name", start_month_options,
+            format_func=lambda m: month_names[m - 1],
+            index=0, key="start_month",
+        )
+    start_date = date(start_year, start_month, 1)
+
+with end_col:
     st.markdown("**End month**")
-    end_month_col, end_year_col = st.columns(2)
-    with end_month_col:
-        end_month_name = st.selectbox(
-            "End month name",
-            MONTHS,
-            index=current_date.month - 1,
-            key="end_month_name",
-            label_visibility="collapsed",
-        )
+    end_year_col, end_month_col = st.columns(2)
     with end_year_col:
         end_year = st.selectbox(
-            "End year",
-            years,
-            index=years.index(current_date.year),
-            key="end_year",
-            label_visibility="collapsed",
+            "End year", year_options,
+            index=len(year_options) - 1, key="end_year",
         )
-
-start_date = date(start_year, MONTH_TO_NUMBER[start_month_name], 1)
-end_date = date(end_year, MONTH_TO_NUMBER[end_month_name], 1)
+    end_month_options = list(range(1, 13))
+    if end_year == today.year:
+        end_month_options = list(range(1, today.month + 1))
+    with end_month_col:
+        end_month = st.selectbox(
+            "End month name", end_month_options,
+            format_func=lambda m: month_names[m - 1],
+            index=len(end_month_options) - 1, key="end_month",
+        )
+    end_date = date(end_year, end_month, 1)
 
 chart_mode = st.radio(
     "Chart display",
@@ -570,34 +562,6 @@ if st.button("Load data and calculate RER", type="primary", use_container_width=
         m1.metric("Valid monthly observations", f"{len(result):,}")
         m2.metric("First available month", result["date"].min().strftime("%b %Y"))
         m3.metric("Last available month", result["date"].max().strftime("%b %Y"))
-
-        # Make gaps in the common monthly sample visible instead of silently
-        # reporting only the count of valid rows.
-        first_month = result["date"].min().to_period("M")
-        last_month = result["date"].max().to_period("M")
-        expected_months = pd.period_range(first_month, last_month, freq="M")
-        observed_months = pd.PeriodIndex(result["date"].dt.to_period("M").unique(), freq="M")
-        missing_months = expected_months.difference(observed_months)
-
-        if len(missing_months):
-            missing_text = ", ".join(str(month) for month in missing_months)
-            st.warning(
-                f"Data coverage check: {len(missing_months)} month(s) are missing "
-                f"between the first and last available observations: {missing_text}. "
-                "These months are excluded from the RER average and real index. "
-                "Check source-series availability before interpreting the results."
-            )
-        else:
-            st.info("Data coverage check: no missing months between the first and last available observations.")
-
-        requested_last = pd.Period(end_period, freq="M")
-        if last_month < requested_last:
-            st.info(
-                f"The requested end month is {requested_last}, but the latest "
-                f"common valid observation is {last_month}. Later months are not "
-                "included because both countries' required data are not available "
-                "as a valid matched observation."
-            )
 
         st.subheader(f"{country_1} vs {country_2}")
         if chart_mode == "Both":
@@ -713,3 +677,4 @@ st.caption(
     "Data source: IMF SDMX 3.0 API. Data availability and definitions vary by country. "
     "Check the exported FX units and manually verify one observation before submitting."
 )
+

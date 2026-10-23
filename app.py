@@ -1,37 +1,76 @@
-"""Real Exchange Rate Explorer — International Finance project.
-
-Calculations follow the project specification:
-  S(t) = X1(t) / X2(t), where X1 and X2 are local-currency units per USD.
-  RER(t) = S(t) * CPI1(t) / CPI2(t).
-  Real Index(t) = 100 * RER(t) / mean(RER over the selected sample).
-
-IMF API availability and series identifiers can change. The app supports IMF SDMX
-JSON responses and CSV upload as a fallback if an IMF series is unavailable.
-"""
-from __future__ import annotations
-
-from io import BytesIO, StringIO
-from typing import Any
+import io
+from datetime import date
 
 import pandas as pd
-import plotly.graph_objects as go
+import plotly.express as px
 import requests
 import streamlit as st
 
-APP_TITLE = "Real Exchange Rate Explorer"
-START_DATE = pd.Timestamp("1976-01-01")
-IMF_API_BASE = "https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA"
+# ------------------------------------------------------------
+# Real Exchange Rate Explorer
+# ------------------------------------------------------------
+# CSV upload format:
+# date,country,cpi,fx
+# 1999-01-01,Euro area,75.2,0.86
+# 1999-01-01,United States,166.6,1.00
+#
+# FX must be expressed as local-currency units per USD.
+# Example: for the euro area, USD/EUR quoted as EUR per USD.
+# The app calculates:
+# Nominal_S = FX_1 / FX_2
+# RER = Nominal_S * CPI_1 / CPI_2
+#
+# Important: IMF SDMX dataflow identifiers and dimensions can change.
+# If the IMF request is rejected, use the CSV upload option. The app
+# displays the failing URL and IMF's response to help diagnose it.
 
-# ISO3 values are used by the IMF series keys. Euro area is included as requested.
-COUNTRIES = {
-    "United States": "USA",
+st.set_page_config(
+    page_title="Real Exchange Rate Explorer",
+    page_icon="📈",
+    layout="wide",
+)
+
+st.title("📈 Real Exchange Rate Explorer")
+st.write(
+    "Compare monthly consumer prices and exchange rates, calculate a "
+    "bilateral real exchange rate (RER), and inspect its movement over time."
+)
+
+with st.expander("How the calculation works", expanded=False):
+    st.markdown(
+        """
+        The app uses the following convention:
+
+        - **FX** = local-currency units per US dollar.
+        - **Nominal exchange-rate ratio** = FX for Country 1 divided by FX for Country 2.
+        - **RER** = nominal exchange-rate ratio × CPI of Country 1 ÷ CPI of Country 2.
+        - **Real index** = RER divided by its average over the selected sample, multiplied by 100.
+
+        An index above 100 means the calculated RER is above its own sample average;
+        below 100 means it is below its sample average. Interpretation depends on
+        the exchange-rate quotation and CPI series used.
+        """
+    )
+
+st.warning(
+    "For meaningful comparisons, use compatible CPI measures and the same "
+    "frequency for both countries. Exchange rates must be local-currency units "
+    "per USD. If the IMF API does not return the requested series, upload a CSV."
+)
+
+# -------------------- Sidebar controls --------------------
+
+st.sidebar.header("Selection")
+
+country_options = {
     "Euro area": "G163",
+    "United States": "USA",
     "United Kingdom": "GBR",
     "Japan": "JPN",
     "Canada": "CAN",
     "Australia": "AUS",
-    "China": "CHN",
     "India": "IND",
+    "China": "CHN",
     "Switzerland": "CHE",
     "Mexico": "MEX",
     "Brazil": "BRA",
@@ -42,266 +81,400 @@ COUNTRIES = {
     "Denmark": "DNK",
     "Singapore": "SGP",
     "South Africa": "ZAF",
-    "Turkey": "TUR",
-    "Indonesia": "IDN",
 }
 
-st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
+country_names = list(country_options.keys())
+default_country_1 = country_names.index("Euro area")
+default_country_2 = country_names.index("United States")
+
+country_1 = st.sidebar.selectbox(
+    "Country 1",
+    country_names,
+    index=default_country_1,
+)
+country_2 = st.sidebar.selectbox(
+    "Country 2",
+    country_names,
+    index=default_country_2,
+)
+
+start_date = st.sidebar.date_input(
+    "Start date",
+    value=date(1999, 1, 1),
+    min_value=date(1947, 1, 1),
+    max_value=date.today(),
+)
+end_date = st.sidebar.date_input(
+    "End date",
+    value=date.today().replace(day=1),
+    min_value=date(1947, 1, 1),
+    max_value=date.today(),
+)
+
+data_source = st.sidebar.radio(
+    "Data source",
+    ["Try IMF API", "Upload CSV"],
+    index=0,
+)
+
+st.sidebar.caption(
+    "The country list is illustrative. IMF coverage and identifiers vary by series."
+)
+
+# -------------------- Data retrieval helpers --------------------
+
+# IMF SDMX 3.0 API root. Individual dataflows / keys may vary.
+IMF_API_BASE = "https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA"
 
 
-def _extract_sdmx_json(payload: dict[str, Any]) -> pd.DataFrame:
-    """Extract time/value observations from common SDMX-JSON layouts."""
-    # SDMX-JSON 2.0-ish data structure
-    data = payload.get("data", payload)
-    if isinstance(data, dict) and "dataSets" in data:
-        structure = data.get("structure", {})
-        dimensions = structure.get("dimensions", {}).get("observation", [])
-        time_dim = next((d for d in dimensions if d.get("id", "").lower() in {"time_period", "time", "period"}), None)
-        time_values = [v.get("id") for v in (time_dim or {}).get("values", [])]
-        observations = data["dataSets"][0].get("observations", {})
-        rows = []
-        for key, value in observations.items():
-            try:
-                idx = int(key.split(":")[-1])
-                rows.append((time_values[idx], value[0] if isinstance(value, list) else value))
-            except (ValueError, IndexError, TypeError):
-                continue
-        if rows:
-            return pd.DataFrame(rows, columns=["date", "value"])
-
-    # SDMX-JSON 1.0-ish structure
-    data_sets = payload.get("DataSet") or payload.get("dataSet")
-    structure = payload.get("Structure") or payload.get("structure") or {}
-    if isinstance(data_sets, list) and data_sets:
-        ds = data_sets[0]
-        series_block = ds.get("Series") or ds.get("series") or {}
-        rows = []
-        def walk(node: Any) -> None:
-            if not isinstance(node, dict):
-                return
-            obs = node.get("Obs") or node.get("observations")
-            if isinstance(obs, list):
-                for item in obs:
-                    if not isinstance(item, dict):
-                        continue
-                    time_val = item.get("TIME_PERIOD") or item.get("TIME_PERIOD_LABEL") or item.get("time")
-                    value = item.get("OBS_VALUE") or item.get("value")
-                    if time_val is not None and value is not None:
-                        rows.append((time_val, value))
-            for val in node.values():
-                if isinstance(val, dict):
-                    walk(val)
-        walk(series_block)
-        if rows:
-            return pd.DataFrame(rows, columns=["date", "value"])
-
-    # Some IMF responses expose observations as a flat array.
-    for key in ("observations", "Observations", "values"):
-        obs = payload.get(key)
-        if isinstance(obs, list) and obs and isinstance(obs[0], dict):
-            rows = []
-            for item in obs:
-                date = item.get("TIME_PERIOD") or item.get("time") or item.get("period")
-                value = item.get("OBS_VALUE") or item.get("value")
-                if date is not None and value is not None:
-                    rows.append((date, value))
-            if rows:
-                return pd.DataFrame(rows, columns=["date", "value"])
-    raise ValueError("The IMF response format was not recognized. Try uploading a CSV file instead.")
+def _monthly_date(value):
+    """Convert common monthly SDMX period formats into a timestamp."""
+    text = str(value).strip()
+    if len(text) == 7 and text[4] == "-":
+        # YYYY-MM
+        text = f"{text}-01"
+    elif len(text) == 8 and text[4] == "M":
+        # YYYY-Mmm, e.g. 2020-M01
+        text = f"{text[:4]}-{text[5:]}-01"
+    return pd.to_datetime(text, errors="coerce")
 
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
-def fetch_imf_series(iso3: str, series_type: str, start_date: str, end_date: str) -> pd.Series:
-    """Fetch one monthly series from IMF SDMX API; raise a useful error if unavailable."""
+def fetch_imf_series(
+    country_code: str,
+    series_type: str,
+    start_period: str,
+    end_period: str,
+) -> pd.Series:
+    """
+    Request one monthly IMF series using SDMX 3.0 and CSV output.
+
+    NOTE: IMF series identifiers differ across dataflows. The CPI key below
+    follows the dot-separated CPI example. The exchange-rate dataflow/key is
+    a best-effort candidate and may need updating if IMF changes its catalogue.
+    """
     if series_type == "CPI":
-        flow, key = "CPI", f"{iso3}.CPI._T.IX_M"
+        flow = "CPI"
+        key = f"{country_code}.CPI._T.IX.M"
+    elif series_type == "FX":
+        flow = "ER"
+        key = f"{country_code}.XDC_USD.PA_RT.M"
     else:
-        flow, key = "ER", f"{iso3}.XDC_USD.PA_RT.M"
-    url = f"{IMF_API_BASE}/{flow}/1.0/{key}"
-    params = {"startPeriod": start_date[:7], "endPeriod": end_date[:7], "format": "json"}
-    response = requests.get(url, params=params, timeout=30)
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"IMF returned HTTP {response.status_code} for {iso3} {series_type}. "
-            "The series key or endpoint may differ for this country. You can upload a CSV instead."
+        raise ValueError("series_type must be 'CPI' or 'FX'")
+
+    url = f"{IMF_API_BASE}/{flow}/~/{key}"
+    params = {
+        "startPeriod": start_period,
+        "endPeriod": end_period,
+    }
+    headers = {"Accept": "text/csv"}
+
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=45,
         )
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise RuntimeError("IMF did not return JSON data. Please try CSV upload.") from exc
-    raw = _extract_sdmx_json(payload)
-    raw["date"] = pd.to_datetime(raw["date"].astype(str).str.replace(r"(\d{4})-(\d{2})$", r"\1-\2-01", regex=True), errors="coerce")
-    raw["value"] = pd.to_numeric(raw["value"], errors="coerce")
-    raw = raw.dropna(subset=["date", "value"]).sort_values("date")
-    raw = raw[(raw["date"] >= pd.Timestamp(start_date)) & (raw["date"] <= pd.Timestamp(end_date))]
-    if raw.empty:
-        raise RuntimeError(f"No usable monthly observations returned for {iso3} {series_type}. Try CSV upload.")
-    result = raw.drop_duplicates("date", keep="last").set_index("date")["value"].astype(float)
-    result.name = f"{iso3}_{series_type}"
-    return result
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Could not connect to the IMF API: {exc}") from exc
 
+    if response.status_code >= 400:
+        body = response.text[:700].replace("\n", " ")
+        raise RuntimeError(
+            f"IMF returned HTTP {response.status_code} for {country_code} {series_type}.\n\n"
+            f"Request URL: {response.url}\n\n"
+            f"Response: {body}"
+        )
 
-def parse_upload(uploaded_file: Any) -> pd.DataFrame:
-    """Accept long or wide CSV. Expected columns include date, country, cpi, fx."""
     try:
-        df = pd.read_csv(uploaded_file)
+        raw = pd.read_csv(io.StringIO(response.text))
     except Exception as exc:
-        raise ValueError(f"Could not read the CSV: {exc}") from exc
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    date_col = next((c for c in ["date", "time", "period", "observation_date"] if c in df.columns), None)
-    if not date_col:
-        raise ValueError("CSV needs a date column named date, time, period, or observation_date.")
-    df["date"] = pd.to_datetime(df[date_col].astype(str).str.replace(r"(\d{4})-(\d{2})$", r"\1-\2-01", regex=True), errors="coerce")
-    if "country" in df.columns and {"cpi", "fx"}.issubset(df.columns):
-        df["country"] = df["country"].astype(str).str.strip()
-        return df[["date", "country", "cpi", "fx"]].copy()
-    # Wide format: date, country1_cpi, country1_fx, country2_cpi, country2_fx
-    return df
+        raise RuntimeError(
+            f"Could not parse the IMF response as CSV for {country_code} {series_type}. "
+            f"The response may not be CSV. Response begins: {response.text[:300]!r}"
+        ) from exc
+
+    raw.columns = [str(column).strip().upper() for column in raw.columns]
+
+    # IMF CSV output can vary by endpoint/version, so look for common names.
+    time_candidates = ["TIME_PERIOD", "TIME", "PERIOD"]
+    value_candidates = ["OBS_VALUE", "OBSERVED_VALUE", "VALUE"]
+
+    time_col = next((c for c in time_candidates if c in raw.columns), None)
+    value_col = next((c for c in value_candidates if c in raw.columns), None)
+
+    if time_col is None or value_col is None:
+        raise RuntimeError(
+            f"Unexpected IMF CSV structure for {country_code} {series_type}. "
+            f"Columns received: {list(raw.columns)}. "
+            f"Response begins: {response.text[:300]!r}"
+        )
+
+    raw["date"] = raw[time_col].map(_monthly_date)
+    raw["value"] = pd.to_numeric(raw[value_col], errors="coerce")
+    raw = raw.dropna(subset=["date", "value"])
+
+    start_ts = pd.Timestamp(start_period + "-01")
+    end_ts = pd.Timestamp(end_period + "-01")
+    raw = raw[(raw["date"] >= start_ts) & (raw["date"] <= end_ts)]
+
+    if raw.empty:
+        raise RuntimeError(
+            f"The IMF API returned no usable monthly observations for "
+            f"{country_code} {series_type} between {start_period} and {end_period}."
+        )
+
+    series = (
+        raw.drop_duplicates("date", keep="last")
+        .sort_values("date")
+        .set_index("date")["value"]
+        .astype(float)
+    )
+    series.name = f"{country_code}_{series_type}"
+    return series
 
 
-def prepare_data(cpi1: pd.Series, fx1: pd.Series, cpi2: pd.Series, fx2: pd.Series,
-                 country1: str, country2: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    frame = pd.concat([
-        cpi1.rename("CPI_1"), fx1.rename("FX_1"),
-        cpi2.rename("CPI_2"), fx2.rename("FX_2"),
-    ], axis=1).sort_index()
-    frame.index.name = "Date"
-    frame = frame.loc[(frame.index >= start) & (frame.index <= end)].copy()
-    frame = frame.dropna(subset=["CPI_1", "FX_1", "CPI_2", "FX_2"])
-    frame = frame[(frame[["CPI_1", "CPI_2", "FX_1", "FX_2"]] > 0).all(axis=1)]
-    if frame.empty:
-        raise ValueError("No overlapping valid monthly data in the selected date range.")
-    # IMF exchange-rate series are local currency units per US dollar.
-    frame["Nominal_S"] = frame["FX_1"] / frame["FX_2"]
-    frame["RER"] = frame["Nominal_S"] * frame["CPI_1"] / frame["CPI_2"]
-    benchmark = frame["RER"].mean()
-    frame["RER_Benchmark_Mean"] = benchmark
-    frame["Real_Index"] = 100.0 * frame["RER"] / benchmark
-    frame["Country_1"] = country1
-    frame["Country_2"] = country2
+def load_imf_country(
+    country_code: str,
+    start_period: str,
+    end_period: str,
+) -> pd.DataFrame:
+    """Load CPI and FX for one country and combine them by month."""
+    cpi = fetch_imf_series(country_code, "CPI", start_period, end_period)
+    fx = fetch_imf_series(country_code, "FX", start_period, end_period)
+
+    frame = pd.concat(
+        [cpi.rename("cpi"), fx.rename("fx")],
+        axis=1,
+    ).sort_index()
+    frame.index.name = "date"
+    frame["country_code"] = country_code
     return frame.reset_index()
 
 
-st.title("📈 Real Exchange Rate Explorer")
-st.caption("Monthly IMF data • Relative purchasing power • Real and nominal exchange rates")
-st.markdown(
-    "Compare two economies using consumer price indices (CPI) and exchange rates. "
-    "This tool is for academic analysis; a real exchange-rate index is a relative measure, not a definitive verdict on fair value."
-)
-
-with st.sidebar:
-    st.header("1. Choose countries")
-    country1 = st.selectbox("Country 1 (numerator)", list(COUNTRIES.keys()), index=list(COUNTRIES.keys()).index("Euro area"))
-    country2 = st.selectbox("Country 2 (denominator)", list(COUNTRIES.keys()), index=list(COUNTRIES.keys()).index("United States"))
-    st.header("2. Choose sample")
-    min_date = START_DATE.date()
-    today = pd.Timestamp.today().date().replace(day=1)
-    start = st.date_input("Start month", value=min_date, min_value=min_date, max_value=today)
-    end = st.date_input("End month", value=today, min_value=min_date, max_value=today)
-    st.header("3. Data source")
-    source_mode = st.radio("Load data from", ["Try IMF API", "Upload CSV files"], index=0)
-
-if country1 == country2:
-    st.warning("Choose two different countries to compare.")
-    st.stop()
-if start > end:
-    st.error("The start date must be on or before the end date.")
-    st.stop()
-
-uploaded = None
-if source_mode == "Upload CSV files":
-    st.subheader("Upload monthly data")
-    st.write("Upload one CSV containing columns `date`, `country`, `cpi`, and `fx`, with one row per country/month. The `fx` column must be local-currency units per USD. Country values must match the country names selected in the sidebar.")
-    uploaded = st.file_uploader("Choose CSV", type=["csv"])
-
-run = st.button("Load data and calculate RER", type="primary", use_container_width=True)
-if run:
+def validate_csv(uploaded_file, country_1_name, country_2_name):
+    """Validate and standardize the uploaded CSV."""
     try:
-        if source_mode == "Try IMF API":
-            iso1, iso2 = COUNTRIES[country1], COUNTRIES[country2]
-            with st.spinner("Requesting monthly CPI and exchange-rate data from the IMF…"):
-                cpi1 = fetch_imf_series(iso1, "CPI", str(start), str(end))
-                fx1 = fetch_imf_series(iso1, "FX", str(start), str(end))
-                cpi2 = fetch_imf_series(iso2, "CPI", str(start), str(end))
-                fx2 = fetch_imf_series(iso2, "FX", str(start), str(end))
-        else:
-            if uploaded is None:
-                st.error("Please upload a CSV file first.")
-                st.stop()
-            loaded = parse_upload(uploaded)
-            required = {"date", "country", "cpi", "fx"}
-            if not required.issubset(loaded.columns):
-                st.error("CSV must be in long format with columns: date, country, cpi, fx.")
-                st.stop()
-            loaded["cpi"] = pd.to_numeric(loaded["cpi"], errors="coerce")
-            loaded["fx"] = pd.to_numeric(loaded["fx"], errors="coerce")
-            loaded = loaded.dropna(subset=["date", "cpi", "fx"])
-            loaded = loaded[(loaded["date"] >= pd.Timestamp(start)) & (loaded["date"] <= pd.Timestamp(end))]
-            def series_for(country: str, col: str) -> pd.Series:
-                part = loaded[loaded["country"].str.casefold() == country.casefold()]
-                if part.empty:
-                    raise ValueError(f"CSV has no rows for '{country}'. Check the country column spelling.")
-                out = part.drop_duplicates("date", keep="last").set_index("date")[col].sort_index()
-                out.name = f"{country}_{col}"
-                return out
-            cpi1, fx1 = series_for(country1, "cpi"), series_for(country1, "fx")
-            cpi2, fx2 = series_for(country2, "cpi"), series_for(country2, "fx")
-        result = prepare_data(cpi1, fx1, cpi2, fx2, country1, country2, pd.Timestamp(start), pd.Timestamp(end))
-        st.session_state["rer_result"] = result
-        st.session_state["rer_country1"] = country1
-        st.session_state["rer_country2"] = country2
-        st.session_state["rer_start"] = str(start)
-        st.session_state["rer_end"] = str(end)
+        data = pd.read_csv(uploaded_file)
     except Exception as exc:
-        st.error(f"Could not calculate the RER: {exc}")
-        st.info("If the IMF API does not recognize a series key, switch to **Upload CSV files**. Use IMF monthly CPI and exchange-rate series, with exchange rates expressed as local-currency units per USD.")
+        raise ValueError(f"Could not read the CSV file: {exc}") from exc
 
-if "rer_result" in st.session_state:
-    result = st.session_state["rer_result"].copy()
-    c1 = st.session_state["rer_country1"]
-    c2 = st.session_state["rer_country2"]
-    latest = result.iloc[-1]
-    c1a, c2a, c3a, c4a = st.columns(4)
-    c1a.metric("Valid monthly observations", f"{len(result):,}")
-    c2a.metric("Latest nominal S (C2 per C1)", f"{latest['Nominal_S']:,.4f}")
-    c3a.metric("Latest real index", f"{latest['Real_Index']:,.2f}")
-    c4a.metric("Sample mean RER", f"{latest['RER_Benchmark_Mean']:,.4f}")
-
-    st.subheader("Exchange rate and purchasing-power comparison")
-    chart_mode = st.radio("Chart view", ["Real index", "Nominal exchange rate", "Both (separate axes)"], horizontal=True)
-    fig = go.Figure()
-    if chart_mode in ("Real index", "Both (separate axes)"):
-        fig.add_trace(go.Scatter(x=result["Date"], y=result["Real_Index"], name="Real index (sample mean = 100)", mode="lines", yaxis="y1"))
-        fig.add_hline(y=100, line_dash="dash", line_color="gray", annotation_text="Sample mean = 100", yref="y")
-    if chart_mode in ("Nominal exchange rate", "Both (separate axes)"):
-        fig.add_trace(go.Scatter(x=result["Date"], y=result["Nominal_S"], name=f"Nominal S: {c2} currency per {c1} currency", mode="lines", yaxis="y2" if chart_mode == "Both (separate axes)" else "y1"))
-    fig.update_layout(
-        template="plotly_white", height=520, hovermode="x unified",
-        xaxis_title="Month", yaxis_title="Real index (100 = sample mean)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        margin=dict(l=20, r=20, t=40, b=20),
-    )
-    if chart_mode == "Both (separate axes)":
-        fig.update_layout(yaxis=dict(title="Real index (100 = sample mean)"), yaxis2=dict(title="Nominal S (C2 currency per C1 currency)", overlaying="y", side="right"))
-    elif chart_mode == "Nominal exchange rate":
-        fig.update_layout(yaxis_title=f"{c2} currency per {c1} currency")
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Data and calculations")
-    st.caption("RER = (FX₁ / FX₂) × (CPI₁ / CPI₂). The benchmark is the arithmetic mean RER over valid months in the selected sample. Real Index = 100 × RER / benchmark.")
-    display_cols = ["Date", "CPI_1", "FX_1", "CPI_2", "FX_2", "Nominal_S", "RER", "RER_Benchmark_Mean", "Real_Index"]
-    st.dataframe(result[display_cols].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
-    csv_bytes = result.to_csv(index=False, date_format="%Y-%m-%d").encode("utf-8")
-    st.download_button("Download all observations and calculations (CSV)", data=csv_bytes,
-                       file_name=f"rer_{COUNTRIES[c1]}_vs_{COUNTRIES[c2]}.csv", mime="text/csv", type="primary")
-
-    with st.expander("How to interpret the result"):
-        st.markdown(
-            "- **Real index above 100:** the calculated RER is above its selected-sample mean.\n"
-            "- **Real index below 100:** the calculated RER is below its selected-sample mean.\n"
-            "- This is a relative benchmark, not proof by itself that a currency is overvalued or undervalued. Interpretation depends on the CPI definitions, exchange-rate quotation, benchmark period, and economic context.\n"
-            "- Confirm that both countries' CPI series use compatible index concepts and that FX is quoted as local-currency units per USD."
+    data.columns = [str(c).strip().lower() for c in data.columns]
+    required = {"date", "country", "cpi", "fx"}
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(
+            "CSV is missing required column(s): "
+            + ", ".join(sorted(missing))
+            + ". Required columns are date, country, cpi, fx."
         )
 
-st.divider()
-st.caption("Data source: International Monetary Fund (IMF), where available. The app does not interpolate missing observations; calculations use months with valid data for all four input series.")
+    data["date"] = pd.to_datetime(data["date"], errors="coerce")
+    data["country"] = data["country"].astype(str).str.strip()
+    data["cpi"] = pd.to_numeric(data["cpi"], errors="coerce")
+    data["fx"] = pd.to_numeric(data["fx"], errors="coerce")
+    data = data.dropna(subset=["date", "country", "cpi", "fx"])
+
+    if data.empty:
+        raise ValueError("The CSV contains no usable rows after parsing.")
+
+    if (data["cpi"] <= 0).any():
+        raise ValueError("CPI values must be greater than zero.")
+    if (data["fx"] <= 0).any():
+        raise ValueError("FX values must be greater than zero.")
+
+    data["month"] = data["date"].dt.to_period("M").dt.to_timestamp()
+    data["country_key"] = data["country"].str.casefold()
+
+    aliases_1 = {country_1_name.casefold(), country_options[country_1_name].casefold()}
+    aliases_2 = {country_2_name.casefold(), country_options[country_2_name].casefold()}
+
+    # Also permit the full country name as entered in the file.
+    available = set(data["country_key"].unique())
+    match_1 = next((x for x in aliases_1 if x in available), None)
+    match_2 = next((x for x in aliases_2 if x in available), None)
+
+    if match_1 is None or match_2 is None:
+        raise ValueError(
+            f"CSV must include rows for '{country_1_name}' (or code "
+            f"{country_options[country_1_name]}) and '{country_2_name}' "
+            f"(or code {country_options[country_2_name]}). "
+            f"Country values found: {', '.join(sorted(data['country'].unique())[:20])}"
+        )
+
+    d1 = data[data["country_key"] == match_1][["month", "cpi", "fx"]].rename(
+        columns={"cpi": "CPI_1", "fx": "FX_1"}
+    )
+    d2 = data[data["country_key"] == match_2][["month", "cpi", "fx"]].rename(
+        columns={"cpi": "CPI_2", "fx": "FX_2"}
+    )
+
+    d1 = d1.groupby("month", as_index=False).last()
+    d2 = d2.groupby("month", as_index=False).last()
+    merged = pd.merge(d1, d2, on="month", how="inner").sort_values("month")
+    return merged
+
+
+def calculate_rer(data: pd.DataFrame) -> pd.DataFrame:
+    """Calculate nominal ratio, RER and sample-normalized real index."""
+    out = data.copy()
+    out = out.dropna(subset=["CPI_1", "CPI_2", "FX_1", "FX_2"])
+    out = out[
+        (out["CPI_1"] > 0)
+        & (out["CPI_2"] > 0)
+        & (out["FX_1"] > 0)
+        & (out["FX_2"] > 0)
+    ].copy()
+
+    if out.empty:
+        raise ValueError("No overlapping, positive CPI and FX observations were available.")
+
+    out["Nominal_S"] = out["FX_1"] / out["FX_2"]
+    out["RER"] = out["Nominal_S"] * out["CPI_1"] / out["CPI_2"]
+    rer_mean = out["RER"].mean()
+
+    if pd.isna(rer_mean) or rer_mean == 0:
+        raise ValueError("Could not normalize the RER because its mean is zero or invalid.")
+
+    out["Real_Index"] = 100 * out["RER"] / rer_mean
+    return out.sort_values("date" if "date" in out.columns else "month")
+
+
+# -------------------- Main app --------------------
+
+if start_date > end_date:
+    st.error("Start date must be earlier than or equal to end date.")
+    st.stop()
+
+start_period = start_date.strftime("%Y-%m")
+end_period = end_date.strftime("%Y-%m")
+
+if data_source == "Upload CSV":
+    st.subheader("Upload monthly data")
+    st.write(
+        "Upload a CSV with columns `date`, `country`, `cpi`, and `fx`. "
+        "Use one row per country per month. The `fx` field must be local-currency "
+        "units per US dollar."
+    )
+    st.code(
+        "date,country,cpi,fx\n"
+        "1999-01-01,Euro area,75.2,0.86\n"
+        "1999-01-01,United States,166.6,1.00\n"
+        "1999-02-01,Euro area,75.4,0.87\n"
+        "1999-02-01,United States,166.8,1.00",
+        language="csv",
+    )
+    uploaded_file = st.file_uploader("Choose CSV file", type=["csv"])
+else:
+    uploaded_file = None
+    st.info(
+        "IMF API mode tries to retrieve CPI and exchange-rate series. "
+        "The IMF API may reject a country/series if its dataflow or dimensions "
+        "differ from the candidate identifiers used here."
+    )
+
+run = st.button("Load data and calculate RER", type="primary", use_container_width=True)
+
+if run:
+    if country_1 == country_2:
+        st.error("Choose two different countries.")
+        st.stop()
+
+    try:
+        with st.spinner("Loading data and calculating the real exchange rate..."):
+            if data_source == "Upload CSV":
+                if uploaded_file is None:
+                    st.error("Please upload a CSV file first.")
+                    st.stop()
+                paired = validate_csv(uploaded_file, country_1, country_2)
+                paired = paired.rename(columns={"month": "date"})
+            else:
+                code_1 = country_options[country_1]
+                code_2 = country_options[country_2]
+
+                data_1 = load_imf_country(code_1, start_period, end_period)
+                data_2 = load_imf_country(code_2, start_period, end_period)
+
+                data_1 = data_1[["date", "cpi", "fx"]].rename(
+                    columns={"cpi": "CPI_1", "fx": "FX_1"}
+                )
+                data_2 = data_2[["date", "cpi", "fx"]].rename(
+                    columns={"cpi": "CPI_2", "fx": "FX_2"}
+                )
+                paired = pd.merge(data_1, data_2, on="date", how="inner").sort_values("date")
+
+            paired["date"] = pd.to_datetime(paired["date"], errors="coerce")
+            paired = paired.dropna(subset=["date"])
+            paired = paired[
+                (paired["date"] >= pd.Timestamp(start_period + "-01"))
+                & (paired["date"] <= pd.Timestamp(end_period + "-01"))
+            ]
+
+            if paired.empty:
+                st.error("No overlapping monthly observations were found for the selected countries and dates.")
+                st.stop()
+
+            result = calculate_rer(paired)
+
+        st.success(f"Calculated RER using {len(result):,} overlapping monthly observations.")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Observations", f"{len(result):,}")
+        c2.metric("First month", result["date"].min().strftime("%b %Y"))
+        c3.metric("Last month", result["date"].max().strftime("%b %Y"))
+
+        st.subheader("Real exchange rate index")
+        fig = px.line(
+            result,
+            x="date",
+            y="Real_Index",
+            title=f"Real Exchange Rate Index: {country_1} vs {country_2}",
+            labels={"date": "Month", "Real_Index": "Real index (sample average = 100)"},
+        )
+        fig.add_hline(y=100, line_dash="dash", annotation_text="Sample average = 100")
+        fig.update_layout(hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("Nominal exchange-rate ratio and unnormalized RER"):
+            fig2 = px.line(
+                result,
+                x="date",
+                y=["Nominal_S", "RER"],
+                title="Nominal ratio and RER",
+                labels={"date": "Month", "value": "Value", "variable": "Series"},
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+
+        st.subheader("Calculated data")
+        display_cols = ["date", "CPI_1", "CPI_2", "FX_1", "FX_2", "Nominal_S", "RER", "Real_Index"]
+        st.dataframe(
+            result[display_cols].round(6),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        csv_bytes = result[display_cols].to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download calculated data as CSV",
+            data=csv_bytes,
+            file_name="real_exchange_rate_results.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    except Exception as exc:
+        st.error("Could not calculate the RER.")
+        st.code(str(exc))
+        if data_source == "Try IMF API":
+            st.markdown(
+                "If the IMF API reports HTTP 404 or an unexpected response, "
+                "the selected IMF dataflow/key is not valid for that series. "
+                "This is an API-series identifier issue, not necessarily a problem "
+                "with the RER formula. Switch to **Upload CSV** to continue."
+            )
+
+st.caption(
+    "Research/educational tool. Results depend on the definitions, units, coverage, "
+    "and quality of the input CPI and exchange-rate series."
+)
